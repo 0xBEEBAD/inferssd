@@ -7,6 +7,7 @@
 #include "ssd/cpu-runtime.h"
 #include "ssd/model-adapter.h"
 #include "ssd/host-gather.h"
+#include "ssd/dense-homes.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -317,6 +318,9 @@ llama_context::llama_context(
 
         if (ssd_runtime) {
             for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            // A model without routed experts streams the layers it keeps in host memory to the GPU; one with them
+            // keeps the scheduler's own rule for any weight there, as before.
+            ssd_runtime->stream.set_streaming(model.hparams.n_expert == 0);
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
                 // the routed layers (up, gate and down experts each) and their expert layout, described once here
@@ -346,7 +350,6 @@ llama_context::llama_context(
             if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
             }
-            ssd_runtime->prepare_dense(model);
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -383,8 +386,9 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
-        // n_ctx 0 with SSD experts: the largest context whose KV cache fits memory when full
-        if (params.n_ctx == 0 && cpu_sink_runtime && cparams.n_seq_max == 1) {
+        // n_ctx 0 in an SSD context: the largest context whose KV cache fits memory when full, with routed experts or
+        // without (the expert caches and the layers a GPU holds give it room as it grows)
+        if (params.n_ctx == 0 && ssd_runtime && cparams.n_seq_max == 1) {
             const uint32_t fitted = fit_context(params_mem);
             if (fitted && fitted < cparams.n_ctx) {
                 cparams.n_ctx = cparams.n_ctx_seq = fitted;
@@ -399,18 +403,23 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
 
         // The KV cache allocates its cells as they are used. Before it allocates more, the expert caches give the room
-        // (on unified memory the device's bytes are the host's DRAM); a refusal fails the batch that needed them.
+        // (on unified memory the device's bytes are the host's DRAM; a discrete GPU's tier gives its own in the
+        // allocation); where they have none left, the layers the GPU holds give theirs; a refusal fails the batch that
+        // needed them.
         if (memory) {
             memory->set_commit([this](size_t host_bytes, size_t device_bytes, const std::function<bool()> & allocate) {
+                const auto grow = [&] {
+                    return allocate() || (device_bytes && give_dense_layers(device_bytes) && allocate());
+                };
                 if (!cpu_sink_runtime) {
-                    return allocate();
+                    return grow();
                 }
                 auto granted = cpu_sink_runtime->take_room(host_bytes, device_bytes);
                 if (!granted) {
                     LLAMA_LOG_ERROR("%s: no room for more KV cache: %s\n", __func__, granted.error.c_str());
                     return false;
                 }
-                if (!allocate()) {
+                if (!grow()) {
                     granted.value.cancel();
                     return false;
                 }
@@ -496,6 +505,9 @@ llama_context::llama_context(
         if (cpu_prefill_actual_shape_enabled) { cparams.n_ubatch = 1; }
 
         sched_reserve();
+
+        // the layers the GPU holds, once the graph is reserved and before the expert caches take their storage
+        hold_dense_layers();
 
         // The expert caches' storage once the worst-case graph is reserved (the GPU tier's on unified memory, the RAM
         // cache's elsewhere when it can give room back; the sink decides): its page population then leaves every
@@ -753,6 +765,90 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
     }
     LLAMA_LOG_CONT("\n");
     return n;
+}
+
+void llama_context::hold_dense_layers() {
+    llama_dense_homes * homes = model.dense_homes();
+    if (!homes || homes->empty() || !homes->next_bytes() || !ssd_runtime || !ssd_runtime->services.gpu_transport) {
+        return;
+    }
+    // what the GPU keeps free beside them: the settings' reserve, the ring the streamed matrices land in, and the
+    // backend's work memory for a product of the largest matrix (a copy of it at 16 bits where it runs through BLAS);
+    // the ring now is part of what is free for them
+    const size_t keep = ssd_runtime->services.gpu_reserve_bytes +
+        ssd::stream::runtime::ring_bytes_for(homes->largest()) + homes->largest_f16();
+    size_t free = 0, total = 0;
+    ggml_backend_dev_memory(homes->device(), &free, &total);
+    free += ssd_runtime->stream.ring_bytes();
+    if (free < keep || free - keep < homes->next_bytes()) {
+        return;
+    }
+    if (sched) { ggml_backend_sched_synchronize(sched.get()); }
+    // the ring was cut for every matrix streamed: a new one for those that still stream
+    ssd_runtime->stream.release_ring();
+    ggml_backend_dev_memory(homes->device(), &free, &total);
+    const size_t pinned_before = homes->pinned_bytes();
+    const size_t held = homes->hold(free > keep ? free - keep : 0);
+    if (homes->pinned_bytes() != pinned_before && ssd_runtime->host) {
+        (void) ssd_runtime->host->note_known_memory_change(); // the held layers' pinned copies went
+    }
+    pin_dense_layers();
+    LLAMA_LOG_INFO("%s: %s holds %.2f GiB of the layers' matrices, %.2f GiB stream (%.2f GiB of them pinned; "
+            "%.2f GiB free, %.2f GiB kept)\n", __func__, ggml_backend_dev_name(homes->device()),
+            homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
+            homes->pinned_bytes() / 1073741824.0, free / 1073741824.0, keep / 1073741824.0);
+    // the graph reserved before read the matrices in host memory and placed their copies in the ring just freed
+    if (gf_res_prev) { gf_res_prev->reset(); }
+    sched_need_reserve = true;
+    sched_reserve();
+}
+
+bool llama_context::give_dense_layers(size_t bytes) {
+    llama_dense_homes * homes = model.dense_homes();
+    if (!homes || homes->held_bytes() == 0 || !ssd_runtime) {
+        return false;
+    }
+    // the work queued reads the layers given back; the ring takes its full size once a layer streams
+    if (sched) { ggml_backend_sched_synchronize(sched.get()); }
+    const uint64_t ring = ssd::stream::runtime::ring_bytes_for(homes->largest());
+    const uint64_t ring_now = ssd_runtime->stream.ring_bytes();
+    const size_t given = homes->give_back(bytes + size_t(ring > ring_now ? ring - ring_now : 0));
+    if (!given) {
+        return false;
+    }
+    pin_dense_layers();
+    LLAMA_LOG_INFO("%s: %s gave back %.2f GiB of the layers' matrices for %.2f MiB: %.2f GiB held, %.2f GiB stream "
+            "(%.2f GiB of them pinned)\n", __func__, ggml_backend_dev_name(homes->device()), given / 1073741824.0,
+            bytes / 1048576.0, homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
+            homes->pinned_bytes() / 1073741824.0);
+    // the graphs split before read the given-back matrices in the device
+    if (gf_res_prev) { gf_res_prev->reset(); }
+    sched_need_reserve = true;
+    return true;
+}
+
+void llama_context::pin_dense_layers() {
+    llama_dense_homes * homes = model.dense_homes();
+    if (!homes || !ssd_runtime || !ssd_runtime->host || !ssd_runtime->services.gpu_transport) {
+        return;
+    }
+    size_t pinned = 0;
+    for (size_t bytes = homes->next_pin_bytes(); bytes; bytes = homes->next_pin_bytes()) {
+        auto ticket = ssd_runtime->host->take(bytes);
+        if (!ticket) {
+            break;
+        }
+        if (!homes->pin_next()) {
+            ticket.value.cancel();
+            break;
+        }
+        ticket.value.commit();
+        pinned += bytes;
+    }
+    // the graphs split before stream the matrices from where they were
+    if (pinned && gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 uint32_t llama_context::memory_n_pos() const {
@@ -1109,7 +1205,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     auto complete_vram_phase = [&](bool decode) {
         return !cpu_sink_runtime || !cpu_sink_runtime->vram_budget || cpu_sink_runtime->phase_complete(decode);
     };
-    // One line per request phase with the copies of the weights homed on the drive: a request's start ends the
+    // One line per request phase with the copies of the streamed weights: a request's start ends the
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
     {
         ggml_backend_sched_ssd_copy_stats now = {};
@@ -1150,6 +1246,8 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             LLAMA_LOG_ERROR("%s: no memory for the KV cache of %u more tokens\n", __func__, prefill_tokens);
             return false;
         }
+        // the cells past the prompt gave their memory back: the GPU holds again the layers it has room for
+        hold_dense_layers();
     }
     // Graphs reserved before were sized for the cache's old cells. A prompt's own graph is reserved from the cache as it
     // is now (actual-shape prefill), and the decode graph again as the prompt ends; otherwise decode() reserves them.
@@ -3297,12 +3395,11 @@ std::string llama_dense_stream_meter::end(const ggml_backend_sched_ssd_copy_stat
     if (phase == nullptr || tensors == 0) {
         return {};
     }
-    char line[320];
+    char line[256];
     snprintf(line, sizeof(line), "[dense_stream] phase=%s tokens=%" PRIu64 " tensors=%" PRIu64 " bytes=%" PRIu64
-        " read_us=%" PRIu64 " first_us=%" PRIu64 " wait_us=%" PRIu64 " readahead=%" PRIu64 " fallbacks=%" PRIu64,
+        " issue_us=%" PRIu64 " ahead=%" PRIu64,
         phase, tokens, tensors, now.dense_bytes - start.dense_bytes, now.dense_read_us - start.dense_read_us,
-        now.dense_first_us - start.dense_first_us, now.dense_wait_us - start.dense_wait_us,
-        now.dense_readahead - start.dense_readahead, now.dense_fallbacks - start.dense_fallbacks);
+        now.dense_readahead - start.dense_readahead);
     return line;
 }
 
