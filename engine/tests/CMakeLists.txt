@@ -518,6 +518,10 @@ if (TARGET ggml-cpu)
     add_test(NAME dsv41_q2_cpu_sink_decode COMMAND test-ssd-cpu-sink
         --q2-activation-test --threads 9 --ring-experts 8)
 
+    add_test(NAME dsv41_mixed_iq_cpu_sink_decode COMMAND test-ssd-cpu-sink
+        --dsv41-iq-test --threads 9 --ring-experts 8)
+    set_tests_properties(dsv41_mixed_iq_cpu_sink_decode PROPERTIES LABELS device SKIP_RETURN_CODE 77)
+
     add_test(NAME ssd_cpu_sink_schedule_invalid COMMAND test-ssd-cpu-sink --schedule-invalid)
     # Sink nodes in ggml graphs on a ggml threadpool of 1, 2, 3 and all CPUs: the production schedule, and a
     # polling one.
@@ -947,6 +951,8 @@ set_tests_properties(test-thread-safety PROPERTIES
     ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_test(test-arg-parser NAME test-ple-args ARGS --ple-only)
+inferssd_ci_test(test-arg-parser test-ple-args)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
