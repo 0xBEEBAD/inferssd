@@ -89,6 +89,10 @@ class LaunchSpec:
     shards: tuple[str, ...] = ()
     # The prompt cache's size limit per model in MiB; None takes PROMPT_CACHE_MIB.
     prompt_cache_mib: Optional[int] = None
+    # The engine's event for each layer and each prompt graph, which the benchmarks read
+    # (docs/architecture/native-observations.md). Without them the events file holds the
+    # settings alone, and a long run does not grow it.
+    layer_events: bool = True
 
 
 def listen_host(text: str) -> str:
@@ -307,6 +311,7 @@ def _resolve(
         "--cache-ram",
         "--cache-disk",
         "--cache-disk-mib",
+        "--ssd-no-layer-events",
         "-ot",
         "--override-tensor",
         "-ts",
@@ -557,6 +562,8 @@ def _resolve(
     for shard in spec.shards:
         command += ["--shard", shard]
     command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
+    if not spec.layer_events:
+        command.append("--ssd-no-layer-events")
     for item in value.entries:
         if item.origin == "cli":
             command += [
