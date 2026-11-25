@@ -49,7 +49,7 @@ enum stop_type {
 };
 
 struct task_params {
-    bool stream          = true;
+    bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
@@ -471,6 +471,7 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     bool post_sampling_probs;
     bool is_progress = false;
+    bool is_begin = false; // signal the HTTP headers before streaming any model output
     completion_token_output prob_output;
     result_timings timings;
     result_prompt_progress progress;
